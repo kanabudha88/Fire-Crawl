@@ -1386,6 +1386,14 @@ describe("FirePDF cache through the lookup service", () => {
     fetchMock.mockImplementationOnce(async ({ schema }: any) =>
       schema.parse(fixture),
     );
+  // Read a counter value through the real prom-client counter (the
+  // counters describe spies on `inc`, which still calls through).
+  const eventCount = async (event: string) => {
+    const data = await firePdfCacheEventsTotal.get();
+    return data.values
+      .filter(v => v.labels.event === event)
+      .reduce((sum, v) => sum + v.value, 0);
+  };
   const base64 = Buffer.from("%PDF-1.7 service test").toString("base64");
   const rawKey = `raw-${crypto
     .createHash("sha256")
@@ -1699,6 +1707,39 @@ describe("FirePDF cache through the lookup service", () => {
     expect(saveCached).not.toHaveBeenCalled();
   });
 
+  it("treats a served suspiciously sparse entry as a miss, without recording a hit (#5759)", async () => {
+    // The reported #5759 document: 46 pages, ~3,000 chars of repeated
+    // header (~59 non-whitespace chars/page). The GCS read path has the
+    // same guard; this pins the cache-service branch, where the served
+    // entry used to be counted and logged as a hit before being rejected.
+    const sparseMarkdown = "EDITAL CULTURAL\n".repeat(200).slice(0, 3096);
+    answerWith({
+      outcome: "hit",
+      key: inlineKey,
+      variant: "base",
+      result: { markdown: sparseMarkdown, pages_processed: 46 },
+    });
+    const meta = serviceMeta();
+    const hitsBefore = await eventCount("hit");
+    const missesBefore = await eventCount("miss");
+    expect(
+      await tryGetCached(meta, base64, "auto", undefined, 5, false, false),
+    ).toBeNull();
+    expect(meta.logger.info).toHaveBeenCalledWith(
+      "Ignoring cached suspected-incomplete FirePDF result",
+      expect.objectContaining({
+        reason: expect.stringContaining("low text density"),
+      }),
+    );
+    // The entry was never used, so it must not be logged or counted as a hit.
+    expect(meta.logger.info).not.toHaveBeenCalledWith(
+      "Using cached FirePDF result",
+      expect.anything(),
+    );
+    expect(await eventCount("hit")).toBe(hitsBefore);
+    expect(await eventCount("miss")).toBe(missesBefore + 1);
+  });
+
   describe("lookup span", () => {
     const exporter = new InMemorySpanExporter();
     let provider: NodeTracerProvider;
@@ -1827,6 +1868,25 @@ describe("FirePDF cache through the lookup service", () => {
       });
     });
 
+    it("records a served suspiciously sparse entry as a miss", async () => {
+      answerWith({
+        outcome: "hit",
+        key: inlineKey,
+        variant: "base",
+        result: {
+          markdown: "EDITAL CULTURAL\n".repeat(200).slice(0, 3096),
+          pages_processed: 46,
+        },
+      });
+      // toMatchObject, as with the unusable-entry test above: the lookup
+      // first records the service's answer (variant/generation), then the
+      // quality gate overwrites the outcome and reason.
+      expect(await lookupSpanAttributes()).toMatchObject({
+        "pdf.cache_outcome": "miss",
+        "pdf.cache_reason": "suspected_incomplete",
+      });
+    });
+
     it("records a failed lookup as an errored span", async () => {
       fetchMock.mockRejectedValueOnce(new Error("timed out"));
       expect(await lookupSpanAttributes()).toEqual({
@@ -1909,5 +1969,152 @@ describe("FirePDF cache and parse table formats", () => {
       markdown: "cached",
     });
     expect(saveCached).toHaveBeenCalled();
+  });
+});
+
+describe("FirePDF cache suspected-incomplete extraction guard (#5759)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getCached.mockResolvedValue(null);
+    saveCached.mockResolvedValue("saved-key");
+  });
+
+  // The reported #5759 document: 46 pages, ~3,000 chars — a repeated page
+  // header and nothing else (~59 non-whitespace chars/page).
+  const sparseMarkdown = "EDITAL CULTURAL\n".repeat(200).slice(0, 3096);
+  const sparseProvenance = {
+    ...provenance,
+    quality: { ...provenance.quality, total_pages: 46 },
+  };
+
+  it("does not cache a suspiciously sparse result, and says why", async () => {
+    const meta = makeMeta();
+    await maybeSaveResult({
+      meta,
+      base64Content: "BASE64",
+      mode: "auto",
+      maxPages: undefined,
+      includePageMarkdown: false,
+      includeBlocks: false,
+      result: {
+        markdown: sparseMarkdown,
+        html: "<p>header</p>",
+        pagesProcessed: 46,
+      },
+      provenance: sparseProvenance,
+      failedPages: null,
+    });
+    expect(saveCached).not.toHaveBeenCalled();
+    expect(meta.logger.info).toHaveBeenCalledWith(
+      "FirePDF result not cached",
+      expect.objectContaining({
+        reason: "suspected_incomplete",
+        cacheKey: "key-of-BASE64",
+      }),
+    );
+  });
+
+  it("still caches a dense result for the same page count", async () => {
+    await maybeSaveResult({
+      meta: makeMeta(),
+      base64Content: "BASE64",
+      mode: "auto",
+      maxPages: undefined,
+      includePageMarkdown: false,
+      includeBlocks: false,
+      result: {
+        markdown: "body text ".repeat(1000),
+        html: "<p>body</p>",
+        pagesProcessed: 46,
+      },
+      provenance: sparseProvenance,
+      failedPages: null,
+    });
+    expect(saveCached).toHaveBeenCalledTimes(1);
+  });
+
+  it("still caches a result that reports no page count (density cannot be judged)", async () => {
+    await maybeSaveResult({
+      meta: makeMeta(),
+      base64Content: "BASE64",
+      mode: "auto",
+      maxPages: undefined,
+      includePageMarkdown: false,
+      includeBlocks: false,
+      result: { markdown: sparseMarkdown, html: "<p>header</p>" },
+      provenance: sparseProvenance,
+      failedPages: null,
+    });
+    expect(saveCached).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a cached suspiciously sparse entry as a miss", async () => {
+    getCached.mockResolvedValueOnce({
+      markdown: sparseMarkdown,
+      html: "<p>header</p>",
+      pagesProcessed: 46,
+      provenance: sparseProvenance,
+      cachedAt: "2026-09-17T20:12:01.000Z",
+      variant: "base",
+    });
+    const meta = makeMeta();
+    const result = await tryGetCached(
+      meta,
+      "BASE64",
+      "auto",
+      undefined,
+      undefined,
+      false,
+      false,
+    );
+    expect(result).toBeNull();
+    expect(meta.logger.info).toHaveBeenCalledWith(
+      "Ignoring cached suspected-incomplete FirePDF result",
+      expect.objectContaining({
+        reason: expect.stringContaining("low text density"),
+      }),
+    );
+  });
+
+  it("still serves a cached dense entry", async () => {
+    const dense = "body text ".repeat(1000);
+    getCached.mockResolvedValueOnce({
+      markdown: dense,
+      html: "<p>body</p>",
+      pagesProcessed: 46,
+      provenance: sparseProvenance,
+      cachedAt: "2026-09-17T20:12:01.000Z",
+      variant: "base",
+    });
+    const result = await tryGetCached(
+      makeMeta(),
+      "BASE64",
+      "auto",
+      undefined,
+      undefined,
+      false,
+      false,
+    );
+    expect(result).toMatchObject({ markdown: dense, pagesProcessed: 46 });
+  });
+
+  it("still serves a cached entry that reports no page count", async () => {
+    getCached.mockResolvedValueOnce({
+      markdown: sparseMarkdown,
+      html: "<p>header</p>",
+      provenance: sparseProvenance,
+      cachedAt: "2026-09-17T20:12:01.000Z",
+      variant: "base",
+    });
+    const result = await tryGetCached(
+      makeMeta(),
+      "BASE64",
+      "auto",
+      undefined,
+      undefined,
+      false,
+      false,
+    );
+    expect(result).toMatchObject({ markdown: sparseMarkdown });
   });
 });
